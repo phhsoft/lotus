@@ -33,32 +33,73 @@ func (s *WindowPoStScheduler) failPost(deadline *dline.Info) {
 		s.failed = eps
 	}
 	s.failLk.Unlock()*/
+
+	s.state.abort(deadline)
 }
 
-func (s *WindowPoStScheduler) doPost(ctx context.Context, deadline *dline.Info, ts *types.TipSet) {
+func (s *WindowPoStScheduler) generatePoST(ctx context.Context, deadline *dline.Info, ts *types.TipSet) {
 	ctx, abort := context.WithCancel(ctx)
 
-	s.abort = abort
-	s.activeDeadline = deadline
+	s.state.startGenerateProof(abort, deadline)
 
 	go func() {
 		defer abort()
 
-		ctx, span := trace.StartSpan(ctx, "WindowPoStScheduler.doPost")
+		ctx, span := trace.StartSpan(ctx, "WindowPoStScheduler.generatePoST")
 		defer span.End()
 
 		posts, err := s.runPost(ctx, *deadline, ts)
 		if err != nil {
 			log.Errorf("runPost failed: %+v", err)
 			s.failPost(deadline)
+			return
 		}
 
+		err = s.state.completeGenerateProof(posts)
+		if err != nil {
+			log.Errorf("completeGenerateProof failed: %+v", err)
+			s.failPost(deadline)
+		}
+	}()
+}
+
+func (s *WindowPoStScheduler) submitPoST(ctx context.Context, deadline *dline.Info, ts *types.TipSet) {
+	ctx, abort := context.WithCancel(ctx)
+
+	posts := s.state.startSubmitPoST(abort)
+
+	go func() {
+		defer abort()
+
+		ctx, span := trace.StartSpan(ctx, "WindowPoStScheduler.submitPoST")
+		defer span.End()
+
+		commEpoch := deadline.Open
+		commRand, err := s.api.ChainGetRandomnessFromTickets(ctx, ts.Key(), crypto.DomainSeparationTag_PoStChainCommit, commEpoch, nil)
+		if err != nil {
+			err = xerrors.Errorf("failed to get chain randomness for windowPost (ts=%d; deadline=%d): %w", ts.Height(), commEpoch, err)
+			log.Errorf("submitPost failed: %+v", err)
+			s.failPost(deadline)
+			return
+		}
+
+		var submitErr error
 		for i := range posts {
-			if err := s.submitPost(ctx, &posts[i]); err != nil {
-				log.Errorf("submitPost failed: %+v", err)
-				s.failPost(deadline)
+			post := &posts[i]
+			post.ChainCommitEpoch = commEpoch
+			post.ChainCommitRand = commRand
+
+			if submitErr = s.submitPost(ctx, post); submitErr != nil {
+				log.Errorf("submitPost failed: %+v", submitErr)
 			}
 		}
+
+		if submitErr != nil {
+			s.failPost(deadline)
+			return
+		}
+
+		s.state.completeSubmitPost()
 	}()
 }
 
@@ -468,19 +509,6 @@ func (s *WindowPoStScheduler) runPost(ctx context.Context, di dline.Info, ts *ty
 	commRand, err := s.api.ChainGetRandomnessFromTickets(ctx, ts.Key(), crypto.DomainSeparationTag_PoStChainCommit, commEpoch, nil)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get chain randomness for windowPost (ts=%d; deadline=%d): %w", ts.Height(), commEpoch, err)
-	}
-
-	for i := range posts {
-		posts[i].ChainCommitEpoch = commEpoch
-		posts[i].ChainCommitRand = commRand
-	}
-
-	// Compute randomness after generating proofs so as to reduce the impact
-	// of chain reorgs (which change randomness)
-	commEpoch := di.Open
-	commRand, err := s.api.ChainGetRandomnessFromTickets(ctx, ts.Key(), crypto.DomainSeparationTag_PoStChainCommit, commEpoch, nil)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to get chain randomness for windowPost (ts=%d; deadline=%d): %w", ts.Height(), di, err)
 	}
 
 	for i := range posts {
